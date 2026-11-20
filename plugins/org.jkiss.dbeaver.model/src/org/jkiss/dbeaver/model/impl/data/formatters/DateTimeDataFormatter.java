@@ -31,7 +31,9 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoField;
 import java.time.temporal.TemporalAccessor;
 import java.util.Date;
 import java.util.Locale;
@@ -48,6 +50,8 @@ public class DateTimeDataFormatter implements DBDDataFormatter {
     private StringBuffer buffer;
     private FieldPosition position;
     private DateTimeFormatter dateTimeFormatter;
+    private DateTimeFormatter zeroNanosFormatter;
+    private DateTimeFormatter parseFormatter;
     private boolean hasZone;
 
     @Override
@@ -64,10 +68,10 @@ public class DateTimeDataFormatter implements DBDDataFormatter {
         dateFormat.setLenient(false);
         buffer = new StringBuffer();
         position = new FieldPosition(0);
-        // DateTimeFormatter pattern for nanoseconds is "n" but old "f" (ExtendedDateFormat)
-        String java8DatePattern = pattern.replaceAll("f+", "n");
-        dateTimeFormatter = DateTimeFormatter.ofPattern(java8DatePattern);
-        hasZone = java8DatePattern.contains("Z");
+        dateTimeFormatter = buildJavaTimeFormatter(pattern, false, false);
+        zeroNanosFormatter = buildJavaTimeFormatter(pattern, true, false);
+        parseFormatter = buildJavaTimeFormatter(pattern, false, true);
+        hasZone = pattern.contains("Z");
     }
 
     @Nullable
@@ -90,21 +94,21 @@ public class DateTimeDataFormatter implements DBDDataFormatter {
     public String formatValue(Object value)
     {
         if (value instanceof Date && zone != null) {
-            return dateTimeFormatter.format(ZonedDateTime.ofInstant(((Date) value).toInstant(), zone));
+            return formatTemporal(ZonedDateTime.ofInstant(((Date) value).toInstant(), zone));
         }
         if (value instanceof TemporalAccessor) {
             if (zone != null) {
                 if (value instanceof LocalDateTime) {
-                    return dateTimeFormatter.format(((LocalDateTime) value).atZone(zone));
+                    return formatTemporal(((LocalDateTime) value).atZone(zone));
                 }
                 if (value instanceof ZonedDateTime) {
-                    return dateTimeFormatter.format(((ZonedDateTime) value).withZoneSameInstant(zone));
+                    return formatTemporal(((ZonedDateTime) value).withZoneSameInstant(zone));
                 }
                 if (value instanceof OffsetDateTime) {
-                    return dateTimeFormatter.format(((OffsetDateTime) value).atZoneSameInstant(zone));
+                    return formatTemporal(((OffsetDateTime) value).atZoneSameInstant(zone));
                 }
             }
-            return dateTimeFormatter.format((TemporalAccessor) value);
+            return formatTemporal((TemporalAccessor) value);
         }
         synchronized (dateFormat) {
             buffer.setLength(0);
@@ -118,14 +122,14 @@ public class DateTimeDataFormatter implements DBDDataFormatter {
         if (typeHint != null) {
             if (LocalDateTime.class.isAssignableFrom(typeHint)) {
                 try {
-                    return LocalDateTime.parse(value, dateTimeFormatter);
+                    return LocalDateTime.parse(value, parseFormatter);
                 } catch (DateTimeParseException e) {
                     throw new ParseException(e.getParsedString(), e.getErrorIndex());
                 }
             }
             if (OffsetDateTime.class.isAssignableFrom(typeHint)) {
                 try {
-                    return OffsetDateTime.parse(value, dateTimeFormatter);
+                    return OffsetDateTime.parse(value, parseFormatter);
                 } catch (DateTimeParseException e) {
                     throw new ParseException(e.getParsedString(), e.getErrorIndex());
                 }
@@ -133,13 +137,97 @@ public class DateTimeDataFormatter implements DBDDataFormatter {
         }
         try {
             if (hasZone) {
-                return OffsetDateTime.parse(value, dateTimeFormatter);
+                return OffsetDateTime.parse(value, parseFormatter);
             } else {
-                return LocalDateTime.parse(value, dateTimeFormatter);
+                return LocalDateTime.parse(value, parseFormatter);
             }
         } catch (Exception e) {
             return dateFormat.parse(value);
         }
+    }
+
+    @NotNull
+    private String formatTemporal(@NotNull TemporalAccessor value) {
+        // ExtendedDateFormat omits an optional fraction section when there are no nanoseconds
+        if (value.isSupported(ChronoField.NANO_OF_SECOND) && value.getLong(ChronoField.NANO_OF_SECOND) == 0) {
+            return zeroNanosFormatter.format(value);
+        }
+        return dateTimeFormatter.format(value);
+    }
+
+    /**
+     * Builds a java.time formatter from an ExtendedDateFormat pattern.
+     * There each 'f' is one digit of the fraction of second, while java.time 'n' is the nano-of-second
+     * number without leading zeros, so every run of 'f' becomes a fixed-width fraction.
+     *
+     * @param skipOptionalFraction drop optional sections holding 'f', as ExtendedDateFormat does for zero nanos
+     * @param forParse accept a fraction of 1 to 9 digits
+     */
+    @NotNull
+    private static DateTimeFormatter buildJavaTimeFormatter(
+        @NotNull String pattern,
+        boolean skipOptionalFraction,
+        boolean forParse
+    ) {
+        DateTimeFormatterBuilder builder = new DateTimeFormatterBuilder();
+        StringBuilder chunk = new StringBuilder();
+        int length = pattern.length();
+        for (int i = 0; i < length; i++) {
+            char c = pattern.charAt(i);
+            if (c == '\'') {
+                int end = pattern.indexOf('\'', i + 1);
+                // An unterminated literal is passed as is, so appendPattern reports it
+                end = end < 0 ? length : end + 1;
+                chunk.append(pattern, i, end);
+                i = end - 1;
+            } else if (c == 'f') {
+                int end = i;
+                while (end < length && pattern.charAt(end) == 'f') {
+                    end++;
+                }
+                if (!chunk.isEmpty()) {
+                    builder.appendPattern(chunk.toString());
+                    chunk.setLength(0);
+                }
+                int width = Math.min(end - i, 9);
+                builder.appendFraction(ChronoField.NANO_OF_SECOND, forParse ? 1 : width, forParse ? 9 : width, false);
+                i = end - 1;
+            } else if (c == '[' && skipOptionalFraction && getFractionSectionEnd(pattern, i) > 0) {
+                i = getFractionSectionEnd(pattern, i);
+            } else {
+                chunk.append(c);
+            }
+        }
+        if (!chunk.isEmpty()) {
+            builder.appendPattern(chunk.toString());
+        }
+        return builder.toFormatter();
+    }
+
+    /**
+     * Returns the index of the ']' closing the optional section that starts at {@code start}
+     * if that section holds a fraction ('f' outside quotes), or -1 otherwise.
+     */
+    private static int getFractionSectionEnd(@NotNull String pattern, int start) {
+        boolean hasFraction = false;
+        int depth = 0;
+        for (int i = start; i < pattern.length(); i++) {
+            char c = pattern.charAt(i);
+            if (c == '\'') {
+                int end = pattern.indexOf('\'', i + 1);
+                if (end < 0) {
+                    return -1;
+                }
+                i = end;
+            } else if (c == 'f') {
+                hasFraction = true;
+            } else if (c == '[') {
+                depth++;
+            } else if (c == ']' && --depth == 0) {
+                return hasFraction ? i : -1;
+            }
+        }
+        return -1;
     }
 
 }
